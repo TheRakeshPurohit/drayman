@@ -246,6 +246,7 @@ describe('', () => {
 
     test('component destroys gracefully if onDestroy causes freeze', async () => {
         const { componentInstanceId, connectionId } = makeIds();
+        const events: any[] = [];
         const messages = await (() => new Promise<{ type, payload, componentInstanceId }[]>((resolve, reject) => {
             const messages = [];
             onInitializeComponentInstance({
@@ -257,6 +258,9 @@ describe('', () => {
                 connectionId,
                 serverCommands: [],
                 componentOptions: {},
+                onComponentInstanceEvent: (event) => {
+                    events.push(event);
+                },
                 emit: async (message) => {
                     messages.push(message);
                     switch (messages.length) {
@@ -281,6 +285,93 @@ describe('', () => {
             (c) => String(c[0]).startsWith('Handle destroy component instance failed for')
         )?.[1];
         expect(String(errArg?.message)).toBe('Timed out after 3000 ms');
+        expect(events.find((event) => event.kind === 'warn' && event.message.startsWith('Handle destroy component instance failed for'))).toMatchObject({
+            id: componentInstanceId,
+            kind: 'warn',
+            status: 'success',
+            endReason: 'user stopped',
+        });
+        expect(events.find((event) => event.kind === 'lifecycle' && event.lifecycleEvent === 'component_ended')).toMatchObject({
+            id: componentInstanceId,
+            kind: 'lifecycle',
+            lifecycleEvent: 'component_ended',
+            status: 'success',
+            endReason: 'user stopped',
+            endTime: expect.any(Date),
+            durationMs: expect.any(Number),
+        });
+    });
+
+    test('component lifecycle event stream exposes lifecycle metadata', async () => {
+        const { componentInstanceId, connectionId } = makeIds();
+        let resolveLegacyDestroyed: () => void = () => { };
+        const legacyDestroyed = new Promise<void>((resolve) => {
+            resolveLegacyDestroyed = resolve;
+        });
+        const events: any[] = [];
+        const messages: any[] = [];
+
+        onInitializeComponentInstance({
+            browserCommands: [],
+            onComponentInstanceConsole: () => { },
+            componentInstanceId,
+            componentName: 'buttons',
+            componentRootDir: 'tests/dist/components',
+            connectionId,
+            namespaceId: 'branch-1',
+            meta: { userId: 'user-1' },
+            serverCommands: [],
+            componentOptions: { text: 'Hello, world!' },
+            onComponentInstanceEvent: (event) => {
+                events.push(event);
+            },
+            emit: async (message) => {
+                messages.push(message);
+                if (message.type === 'view') {
+                    onDestroyComponentInstance({ componentInstanceId });
+                    return;
+                }
+                if (message.type === 'componentInstanceDestroyed') {
+                    resolveLegacyDestroyed();
+                }
+            },
+        });
+
+        await legacyDestroyed;
+
+        const initializedPayload = events.find((event) => event.kind === 'lifecycle' && event.lifecycleEvent === 'component_started');
+        const destroyedPayload = events.find((event) => event.kind === 'lifecycle' && event.lifecycleEvent === 'component_ended');
+        expect(initializedPayload).toMatchObject({
+            id: componentInstanceId,
+            entityId: 'buttons',
+            type: 'component',
+            kind: 'lifecycle',
+            status: 'processing',
+            lifecycleEvent: 'component_started',
+            branchId: 'branch-1',
+            connectionId,
+            userId: 'user-1',
+            heapUsed: 0,
+            externalUsed: 0,
+            endReason: null,
+            endTime: null,
+            durationMs: null,
+        });
+        expect(destroyedPayload).toMatchObject({
+            id: componentInstanceId,
+            entityId: 'buttons',
+            type: 'component',
+            kind: 'lifecycle',
+            status: 'success',
+            lifecycleEvent: 'component_ended',
+            branchId: 'branch-1',
+            connectionId,
+            userId: 'user-1',
+            endReason: 'user stopped',
+            endTime: expect.any(Date),
+            durationMs: expect.any(Number),
+        });
+        expect(messages.some(message => message.type === 'componentInstanceDestroyed')).toBe(true);
     });
 
     test('component destroys gracefully if onInit is frozen', async () => {

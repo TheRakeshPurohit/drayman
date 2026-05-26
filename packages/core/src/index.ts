@@ -6,6 +6,43 @@ import { spawn, Thread, Worker } from 'threads';
 import { exec } from 'child_process';
 import _ from 'lodash';
 
+type ComponentLifecycleEventType = 'component_started' | 'component_ended';
+type ComponentLifecycleStatus = 'processing' | 'success' | 'error';
+
+type ComponentInstanceSnapshot = {
+    id: string;
+    parentId: null;
+    rootId: string;
+    ancestorIds: string;
+    entityId: string;
+    type: 'component';
+    status: ComponentLifecycleStatus;
+    startTime: Date;
+    endTime: Date | null;
+    durationMs: number | null;
+    userId: any;
+    branchId: string;
+    connectionId: string;
+    heapLimit: number;
+    externalLimit: number;
+    heapUsed: number;
+    externalUsed: number;
+    endReason: string | null;
+};
+
+type ComponentLifecycleEvent = ComponentInstanceSnapshot & {
+    kind: 'lifecycle';
+    lifecycleEvent: ComponentLifecycleEventType;
+};
+
+type ComponentWarnEvent = ComponentInstanceSnapshot & {
+    kind: 'warn';
+    message: string;
+    error?: any;
+};
+
+type ComponentInstanceEvent = ComponentLifecycleEvent | ComponentWarnEvent;
+
 type ComponentInstance = {
     heapLimit: number;
     componentName: string;
@@ -13,12 +50,17 @@ type ComponentInstance = {
     externalLimit: number;
     terminatingPromise: Promise<void> | null;
     emit: any;
+    onComponentInstanceEvent?: (event: ComponentInstanceEvent) => void;
     lastHeartbeat: number;
     heapUsed: number;
     externalUsed: number;
     eventsSub?: { unsubscribe: () => void };
     component: string;
     startDate: Date;
+    endDate: Date | null;
+    durationMs: number | null;
+    status: ComponentLifecycleStatus;
+    endReason: string | null;
     worker: any;
     eventRequests: {
         [requestId: string]: {
@@ -32,7 +74,7 @@ type ComponentInstance = {
     meta?: any;
 };
 
-type ComponentGarbageOpts = { skipOnDestroy?: boolean };
+type ComponentGarbageOpts = { skipOnDestroy?: boolean; endReason?: string | null; markedAt?: number };
 
 const getNpmPackages = (nodeModulesPath) => {
     return new Promise<string[]>((resolve) => {
@@ -63,6 +105,81 @@ const withTimeout = async <T>(p: Promise<T>, ms: number) => {
     ]);
 }
 
+const getComponentEndStatus = (endReason: string | null | undefined): ComponentLifecycleStatus => {
+    return (endReason === 'resource limited' || endReason === 'worker failed') ? 'error' : 'success';
+};
+
+const buildComponentSnapshot = (
+    componentInstanceId: string,
+    instance: ComponentInstance,
+): ComponentInstanceSnapshot => {
+    return {
+        id: componentInstanceId,
+        parentId: null,
+        rootId: componentInstanceId,
+        ancestorIds: '',
+        entityId: instance.componentName,
+        type: 'component',
+        status: instance.status || 'processing',
+        startTime: instance.startDate,
+        endTime: instance.endDate || null,
+        durationMs: instance.durationMs ?? null,
+        userId: instance.meta?.userId ?? null,
+        branchId: instance.namespaceId,
+        connectionId: instance.connectionId,
+        heapLimit: instance.heapLimit,
+        externalLimit: instance.externalLimit,
+        heapUsed: instance.heapUsed,
+        externalUsed: instance.externalUsed,
+        endReason: instance.endReason ?? null,
+    };
+}
+
+const buildComponentLifecycleEvent = (
+    componentInstanceId: string,
+    instance: ComponentInstance,
+    lifecycleEvent: ComponentLifecycleEventType,
+): ComponentLifecycleEvent => {
+    return {
+        ...buildComponentSnapshot(componentInstanceId, instance),
+        kind: 'lifecycle',
+        lifecycleEvent,
+    };
+}
+
+const buildComponentWarnEvent = (
+    componentInstanceId: string,
+    instance: ComponentInstance,
+    message: string,
+    error?: any,
+): ComponentWarnEvent => {
+    return {
+        ...buildComponentSnapshot(componentInstanceId, instance),
+        kind: 'warn',
+        message,
+        error,
+    };
+}
+
+const emitComponentInstanceEvent = (componentInstanceId: string, instance: ComponentInstance, event: ComponentInstanceEvent) => {
+    try {
+        instance.onComponentInstanceEvent?.(event);
+    } catch (e) {
+        console.warn(`Failed to emit componentInstanceEvent for ${componentInstanceId} (${instance.component})`, e);
+    }
+};
+
+const warnComponentInstance = (componentInstanceId: string, instance: ComponentInstance | undefined, message: string, error?: any) => {
+    if (instance) {
+        emitComponentInstanceEvent(componentInstanceId, instance, buildComponentWarnEvent(componentInstanceId, instance, message, error));
+    }
+    if (error !== undefined) {
+        console.warn(message, error);
+    } else {
+        console.warn(message);
+    }
+};
+
 const safeParse = (value) => {
     if (typeof value !== 'string') {
         return value;
@@ -75,12 +192,20 @@ const safeParse = (value) => {
 }
 
 const garbage = {
-    connections: new Set<string>(),
+    connections: new Map<string, ComponentGarbageOpts>(),
     componentInstances: new Map<string, ComponentGarbageOpts>(),
 };
 
-const markConnectionGarbage = (connectionId: string) => {
-    garbage.connections.add(connectionId);
+const markConnectionGarbage = (connectionId: string, opts: ComponentGarbageOpts = {}) => {
+    if (!connectionId) {
+        return;
+    }
+    const prev = garbage.connections.get(connectionId) || {};
+    garbage.connections.set(connectionId, {
+        skipOnDestroy: Boolean(prev.skipOnDestroy || opts.skipOnDestroy),
+        endReason: prev.endReason || opts.endReason || null,
+        markedAt: prev.markedAt || opts.markedAt || Date.now(),
+    });
     clearGarbage();
 }
 
@@ -91,6 +216,8 @@ const markComponentGarbage = (componentInstanceId: string, opts: ComponentGarbag
     const prev = garbage.componentInstances.get(componentInstanceId) || {};
     garbage.componentInstances.set(componentInstanceId, {
         skipOnDestroy: Boolean(prev.skipOnDestroy || opts.skipOnDestroy),
+        endReason: prev.endReason || opts.endReason || null,
+        markedAt: prev.markedAt || opts.markedAt || Date.now(),
     });
     clearGarbage();
 }
@@ -98,8 +225,16 @@ const markComponentGarbage = (componentInstanceId: string, opts: ComponentGarbag
 const clearGarbage = () => {
     const aliveIds = Object.keys(componentInstances);
     const fromConnections = new Map<string, ComponentGarbageOpts>();
-    const remainingConnections = new Set<string>();
-    for (const connectionId of garbage.connections) {
+    const remainingConnections = new Map<string, ComponentGarbageOpts>();
+    const mergeGarbageOpts = (current: ComponentGarbageOpts | undefined, next: ComponentGarbageOpts) => {
+        if (!current) {
+            return next;
+        }
+        const currentAt = current.markedAt ?? Number.POSITIVE_INFINITY;
+        const nextAt = next.markedAt ?? Number.POSITIVE_INFINITY;
+        return currentAt <= nextAt ? current : next;
+    };
+    for (const [connectionId, connectionOpts] of garbage.connections) {
         let hasAliveInstance = false;
         for (const id of aliveIds) {
             const instance = componentInstances[id];
@@ -107,21 +242,25 @@ const clearGarbage = () => {
                 continue;
             }
             hasAliveInstance = true;
-            fromConnections.set(id, { skipOnDestroy: false });
+            fromConnections.set(id, mergeGarbageOpts(fromConnections.get(id), {
+                skipOnDestroy: Boolean(connectionOpts.skipOnDestroy),
+                endReason: connectionOpts.endReason || null,
+                markedAt: connectionOpts.markedAt || Date.now(),
+            }));
         }
         if (!hasAliveInstance) {
-            remainingConnections.add(connectionId);
+            remainingConnections.set(connectionId, connectionOpts);
         }
     }
     const explicit = new Map(garbage.componentInstances);
     const remainingExplicit = new Map<string, ComponentGarbageOpts>();
     const toTerminate = new Map<string, ComponentGarbageOpts>();
     for (const [id, opts] of fromConnections) {
-        toTerminate.set(id, { skipOnDestroy: Boolean(opts.skipOnDestroy) });
+        toTerminate.set(id, opts);
     }
     for (const [id, opts] of explicit) {
-        const prev = toTerminate.get(id) || { skipOnDestroy: false };
-        const mergedOpts = { skipOnDestroy: Boolean(prev.skipOnDestroy || opts.skipOnDestroy) };
+        const prev = toTerminate.get(id);
+        const mergedOpts = mergeGarbageOpts(prev, opts);
         if (!componentInstances[id]) {
             remainingExplicit.set(id, mergedOpts);
             continue;
@@ -133,19 +272,19 @@ const clearGarbage = () => {
         if (!instance || instance.terminatingPromise) {
             continue;
         }
-        terminateComponentInstance(id, Boolean(opts.skipOnDestroy));
+        terminateComponentInstance(id, opts);
     }
     garbage.componentInstances.clear();
     for (const [id, opts] of remainingExplicit) {
         garbage.componentInstances.set(id, opts);
     }
     garbage.connections.clear();
-    for (const connectionId of remainingConnections) {
-        garbage.connections.add(connectionId);
+    for (const [connectionId, connectionOpts] of remainingConnections) {
+        garbage.connections.set(connectionId, connectionOpts);
     }
 };
 
-async function terminateComponentInstance(componentInstanceId: string, skipOnDestroy = false) {
+async function terminateComponentInstance(componentInstanceId: string, opts: ComponentGarbageOpts = {}) {
     const instance = componentInstances[componentInstanceId];
     if (!instance) {
         return;
@@ -159,24 +298,36 @@ async function terminateComponentInstance(componentInstanceId: string, skipOnDes
                 instance.eventRequests[requestId].onError({ err: `Component instance was destroyed` });
             } catch { }
         }
-        if (!skipOnDestroy) {
+        if (opts.endReason && !instance.endReason) {
+            instance.endReason = opts.endReason;
+        }
+        instance.status = getComponentEndStatus(instance.endReason || opts.endReason);
+        if (!opts.skipOnDestroy) {
             try {
                 await withTimeout(instance.worker.handleDestroyComponentInstance(), 3000);
             } catch (e) {
-                console.warn(`Handle destroy component instance failed for ${componentInstanceId} (${instance.component})`, e);
+                warnComponentInstance(componentInstanceId, instance, `Handle destroy component instance failed for ${componentInstanceId} (${instance.component})`, e);
             }
         }
         try {
             await withTimeout(Thread.terminate(instance.worker), 1000);
         } catch (e) {
-            console.warn(`Thread.terminate failed for ${componentInstanceId} (${instance.component})`, e);
+            warnComponentInstance(componentInstanceId, instance, `Thread.terminate failed for ${componentInstanceId} (${instance.component})`, e);
         }
         try {
             instance.eventsSub?.unsubscribe?.();
         } catch (e) {
-            console.warn(`Failed to unsubscribe events for ${componentInstanceId} (${instance.component})`, e);
+            warnComponentInstance(componentInstanceId, instance, `Failed to unsubscribe events for ${componentInstanceId} (${instance.component})`, e);
         }
+        try {
+            if (!instance.endDate) {
+                instance.endDate = new Date();
+                instance.durationMs = instance.startDate ? (instance.endDate.getTime() - instance.startDate.getTime()) : null;
+            }
+        } catch (_) { }
+        const destroyedEvent = buildComponentLifecycleEvent(componentInstanceId, instance, 'component_ended');
         delete componentInstances[componentInstanceId];
+        emitComponentInstanceEvent(componentInstanceId, instance, destroyedEvent);
         try {
             instance?.emit?.({
                 type: 'componentInstanceDestroyed',
@@ -184,7 +335,7 @@ async function terminateComponentInstance(componentInstanceId: string, skipOnDes
                 componentInstanceId,
             });
         } catch (e) {
-            console.warn(`Failed to emit componentInstanceDestroyed for ${componentInstanceId} (${instance.component})`, e);
+            warnComponentInstance(componentInstanceId, instance, `Failed to emit componentInstanceDestroyed for ${componentInstanceId} (${instance.component})`, e);
         }
     })();
 
@@ -199,8 +350,8 @@ setInterval(() => {
         }
         const limit = instance.heartbeatLimitMs;
         if (now - instance.lastHeartbeat > limit) {
-            console.warn(`Heartbeat limit reached (${limit} ms) — stopping ${id} (${instance.component})`);
-            markComponentGarbage(id, { skipOnDestroy: true });
+            warnComponentInstance(id, instance, `Heartbeat limit reached (${limit} ms) — stopping ${id} (${instance.component})`);
+            markComponentGarbage(id, { skipOnDestroy: true, endReason: 'resource limited' });
         }
     }
 }, 1000);
@@ -235,7 +386,7 @@ export const handleComponentEvent = ({ componentInstanceId, eventName, options, 
             try {
                 current.worker.cancelComponentEvent({ requestId });
             } catch {
-                console.warn(`Failed to cancel component event ${eventName} (${requestId}) for ${componentInstanceId} (${instance.component})`);
+                warnComponentInstance(componentInstanceId, current, `Failed to cancel component event ${eventName} (${requestId}) for ${componentInstanceId} (${current.component})`);
             }
         }
     };
@@ -265,7 +416,7 @@ export const onUpdateComponentInstanceProps = ({ componentInstanceId, options })
     try {
         instance.worker.updateComponentInstanceProps({ options });
     } catch {
-        console.warn(`Failed to update props for component instance ${componentInstanceId} (${instance.component})`);
+        warnComponentInstance(componentInstanceId, instance, `Failed to update props for component instance ${componentInstanceId} (${instance.component})`);
     }
 };
 
@@ -277,7 +428,7 @@ export const onHandleBrowserCallback = ({ callbackId, data }) => {
         try {
             instance.worker.handleBrowserCallback({ callbackId, data });
         } catch {
-            console.warn(`Failed to handle browser callback ${callbackId} for component instance ${componentInstanceId} (${instance.component})`);
+            warnComponentInstance(componentInstanceId, instance, `Failed to handle browser callback ${callbackId} for component instance ${componentInstanceId} (${instance.component})`);
         }
     }
 };
@@ -290,7 +441,7 @@ export const handleEventHubEvent = async ({ data, groupId = null, type, namespac
         try {
             instance.worker.handleEventHubEvent({ type, data, groupId });
         } catch {
-            console.warn(`Failed to handle event hub event ${type} for component instance ${componentInstanceId} (${instance.component})`);
+            warnComponentInstance(componentInstanceId, instance, `Failed to handle event hub event ${type} for component instance ${componentInstanceId} (${instance.component})`);
         }
     }
 };
@@ -332,19 +483,27 @@ export const onInitializeComponentInstance = async ({
     browserCommands,
     serverCommands,
     onEventHubEvent = null,
+    onComponentInstanceEvent = null,
     heapLimit = 512,
     externalLimit = 512,
     heartbeatLimitMs = 3 * 1000,
     meta = null,
 }) => {
     componentOptions = safeParse(componentOptions);
+    let componentInstanceRegistered = false;
     const internalWorker = new Worker(`./component-processor.js`, {
         resourceLimits: {
             maxOldGenerationSizeMb: heapLimit,
         }
     });
-    internalWorker.addEventListener('error', (err) => {
-        markComponentGarbage(componentInstanceId, { skipOnDestroy: true });
+    internalWorker.addEventListener('error', () => {
+        if (componentInstanceRegistered) {
+            const instance = componentInstances[componentInstanceId];
+            if (!instance || instance.terminatingPromise) {
+                return;
+            }
+        }
+        markComponentGarbage(componentInstanceId, { skipOnDestroy: true, endReason: 'worker failed' });
     });
     const worker = await spawn(internalWorker);
     componentInstances[componentInstanceId] = {
@@ -354,12 +513,17 @@ export const onInitializeComponentInstance = async ({
         componentName,
         worker,
         emit,
+        onComponentInstanceEvent,
         lastHeartbeat: Date.now(),
         heapUsed: 0,
         externalUsed: 0,
         terminatingPromise: null,
         component: `${componentNamePrefix}${componentName}`,
         startDate: new Date(),
+        endDate: null,
+        durationMs: null,
+        status: 'processing',
+        endReason: null,
         meta,
         /**
          * Used to store user event requests (on button click, on input, etc.).
@@ -368,6 +532,7 @@ export const onInitializeComponentInstance = async ({
         connectionId,
         namespaceId,
     };
+    componentInstanceRegistered = true;
     const subscription = worker.events().subscribe({
         next: ({ type, payload }) => {
             /**
@@ -382,7 +547,7 @@ export const onInitializeComponentInstance = async ({
                             err ? req.onError({ err }) : req.onSuccess({ result });
                         }
                     } catch {
-                        console.warn(`Failed to process response for request ${requestId} in component instance ${componentInstanceId} (${componentInstances[componentInstanceId].component})`);
+                        warnComponentInstance(componentInstanceId, componentInstances[componentInstanceId], `Failed to process response for request ${requestId} in component instance ${componentInstanceId} (${componentInstances[componentInstanceId].component})`);
                     } finally {
                         delete componentInstances[componentInstanceId].eventRequests[requestId];
                     }
@@ -409,27 +574,35 @@ export const onInitializeComponentInstance = async ({
                 instance.externalUsed = extUsedMB;
                 instance.lastHeartbeat = Date.now();
                 if (heapExceeded || extExceeded) {
-                    console.warn(`Memory limit exceeded (heap: ${heapExceeded} ${heapUsedMB}/${instance.heapLimit}, external: ${extExceeded} ${extUsedMB}/${instance.externalLimit}) — stopping ${componentInstanceId} (${instance.component})`);
-                    markComponentGarbage(componentInstanceId, { skipOnDestroy: true });
+                    warnComponentInstance(componentInstanceId, instance, `Memory limit exceeded (heap: ${heapExceeded} ${heapUsedMB}/${instance.heapLimit}, external: ${extExceeded} ${extUsedMB}/${instance.externalLimit}) — stopping ${componentInstanceId} (${instance.component})`);
+                    markComponentGarbage(componentInstanceId, { skipOnDestroy: true, endReason: 'resource limited' });
                 }
             } else {
                 try {
                     emit({ type, payload, componentInstanceId });
                 } catch (e) {
-                    console.warn(`Failed to emit event ${type} for ${componentInstanceId} (${componentInstances[componentInstanceId].component})`, e);
+                    warnComponentInstance(componentInstanceId, componentInstances[componentInstanceId], `Failed to emit event ${type} for ${componentInstanceId} (${componentInstances[componentInstanceId].component})`, e);
                 }
             }
         },
         error: (err) => {
-            markComponentGarbage(componentInstanceId, { skipOnDestroy: true });
+            const instance = componentInstances[componentInstanceId];
+            if (!instance || instance.terminatingPromise) {
+                return;
+            }
+            markComponentGarbage(componentInstanceId, { skipOnDestroy: true, endReason: 'worker failed' });
         },
         complete: () => {
-            markComponentGarbage(componentInstanceId, { skipOnDestroy: true });
+            const instance = componentInstances[componentInstanceId];
+            if (!instance || instance.terminatingPromise) {
+                return;
+            }
+            markComponentGarbage(componentInstanceId, { skipOnDestroy: true, endReason: 'worker failed' });
         },
     });
     componentInstances[componentInstanceId].eventsSub = subscription;
     try {
-        worker.initializeComponentInstance({
+        const initializePromise = worker.initializeComponentInstance({
             browserCommands,
             serverCommands,
             componentNamePrefix,
@@ -441,17 +614,26 @@ export const onInitializeComponentInstance = async ({
             extensionsOptions,
             logging,
         });
+        initializePromise?.catch?.(() => {
+            const instance = componentInstances[componentInstanceId];
+            if (!instance || instance.terminatingPromise) {
+                return;
+            }
+            markComponentGarbage(componentInstanceId, { skipOnDestroy: true, endReason: 'worker failed' });
+        });
+        const initializedEvent = buildComponentLifecycleEvent(componentInstanceId, componentInstances[componentInstanceId], 'component_started');
+        emitComponentInstanceEvent(componentInstanceId, componentInstances[componentInstanceId], initializedEvent);
     } catch {
-        markComponentGarbage(componentInstanceId, { skipOnDestroy: true });
+        markComponentGarbage(componentInstanceId, { skipOnDestroy: true, endReason: 'worker failed' });
     }
     clearGarbage();
 }
 
 export const onDisconnect = async ({ connectionId }) => {
-    markConnectionGarbage(connectionId);
+    markConnectionGarbage(connectionId, { endReason: 'user stopped' });
 };
 
 
 export const onDestroyComponentInstance = async ({ componentInstanceId }) => {
-    markComponentGarbage(componentInstanceId, { skipOnDestroy: false });
+    markComponentGarbage(componentInstanceId, { skipOnDestroy: false, endReason: 'user stopped' });
 };
